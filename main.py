@@ -43,7 +43,7 @@ def extract_shortcode_from_url(url: str) -> str | None:
 def download_post(req: PostRequest):
     """
     Recebe { "url": "https://www.instagram.com/p/..." }
-    e devolve infos do post + URL direta da mídia
+    e devolve infos do post + TODAS as mídias (carrossel, vídeo, imagem única)
     """
     shortcode = extract_shortcode_from_url(req.url)
     if not shortcode:
@@ -52,20 +52,47 @@ def download_post(req: PostRequest):
     try:
         post = Post.from_shortcode(L.context, shortcode)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao acessar o post: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao acessar o post: {e}. "
+                   f"Verifique se o post é público e se o login foi configurado."
+        )
 
-    media_url = post.video_url if post.is_video else post.url
+    # Monta lista de mídias
+    media_list = []
+
+    # Verifica se é carrossel (sidecar)
+    if post.typename == "GraphSidecar":
+        # Post com várias imagens / vídeos (carrossel)
+        for idx, node in enumerate(post.get_sidecar_nodes()):
+            url = node.video_url if node.is_video else node.display_url
+            media_list.append({
+                "index": idx,
+                "is_video": node.is_video,
+                "media_url": url,
+            })
+    else:
+        # Post “normal” (uma imagem ou um vídeo)
+        url = post.video_url if post.is_video else post.url
+        media_list.append({
+            "index": 0,
+            "is_video": post.is_video,
+            "media_url": url,
+        })
+
+    # Pra manter compatibilidade, ainda mandamos o primeiro media_url no topo
+    first_media_url = media_list[0]["media_url"] if media_list else None
 
     return {
         "shortcode": shortcode,
         "caption": post.caption or "",
-        "is_video": post.is_video,
-        "media_url": media_url,
         "owner_username": post.owner_username,
         "taken_at": post.date_utc.isoformat(),
+        "is_sidecar": post.typename == "GraphSidecar",
+        "media": media_list,          # TODAS as mídias
+        "media_url": first_media_url, # primeira mídia (legacy)
     }
-
-
+    
 @app.get("/health")
 def health():
     return {"status": "ok"}
