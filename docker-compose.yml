@@ -1,0 +1,7 @@
+services:
+  instaloader-service:
+    build: .
+    container_name: instaloader-service
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
