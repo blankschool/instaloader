@@ -1,21 +1,40 @@
+import os
+import time
+import uuid
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from instaloader import Instaloader, Post
+import instaloader
+from instaloader.exceptions import BadResponseException, QueryReturnedNotFoundException
+
+# ---------- CONFIG ----------
+
+INSTAGRAM_USER = "grupocrasto"
+BASE_DIR = Path(__file__).parent
+SESSION_FILE = BASE_DIR / "instaloader" / f"session-{INSTAGRAM_USER}"
+
+# ---------- INSTALOADER GLOBAL ----------
+
+L = instaloader.Instaloader()
+
+try:
+    # carrega a sessão que você subiu pro repo
+    L.load_session_from_file(INSTAGRAM_USER, str(SESSION_FILE))
+    print("Sessão Instagram carregada com sucesso.")
+    print("Logado como:", L.test_login())
+except Exception as e:
+    print("ERRO ao carregar sessão do Instagram:", e)
+    # aqui eu não levanto exceção pra não quebrar o container na subida,
+    # mas os endpoints vão falhar até você corrigir
+    # se quiser ser mais rígido, troque por: raise
+
+# ---------- FASTAPI ----------
 
 app = FastAPI(
     title="Instaloader Microservice",
-    description="Serviço simples para pegar dados de posts do Instagram via Instaloader",
+    description="Baixa/consulta posts do Instagram usando sessão grupocrasto",
     version="1.0.0",
-)
-
-# Instância global do Instaloader (não baixa nada, só usa como client)
-L = Instaloader(
-    download_pictures=False,
-    download_videos=False,
-    download_video_thumbnails=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
 )
 
 
@@ -23,76 +42,91 @@ class PostRequest(BaseModel):
     url: str
 
 
-def extract_shortcode_from_url(url: str) -> str | None:
+def shortcode_from_url(url: str) -> str:
     """
-    Recebe uma URL de post do Instagram e extrai o shortcode.
-    Exemplo:
-      https://www.instagram.com/p/ABC123xyz/ -> ABC123xyz
+    Extrai o shortcode de URLs do tipo:
+    https://www.instagram.com/p/DRNRfHRD4VF/
+    https://www.instagram.com/reel/DRNRfHRD4VF/
+    https://www.instagram.com/p/DRNRfHRD4VF/?utm_source=...
     """
-    base = url.split("?")[0]
-    parts = [p for p in base.split("/") if p]
-    if not parts:
-        return None
+    parts = url.split("/")
+    # tira parâmetros
+    parts = [p for p in parts if p]
+    # shortcode é o último pedaço "não vazio" da URL (p/reel/p)
     shortcode = parts[-1]
-    if shortcode in ("p", "reel", "tv") and len(parts) >= 2:
-        shortcode = parts[-1]
-    return shortcode or None
+    # se vier com querystring, remove
+    if "?" in shortcode:
+        shortcode = shortcode.split("?", 1)[0]
+    return shortcode
 
 
-@app.post("/download_post")
-def download_post(req: PostRequest):
+def get_post_with_retry(shortcode: str, max_retries: int = 3):
     """
-    Recebe { "url": "https://www.instagram.com/p/..." }
-    e devolve infos do post + TODAS as mídias (carrossel, vídeo, imagem única)
+    Envolve o Post.from_shortcode com retry/backoff
+    pra tratar "Please wait a few minutes before you try again".
     """
-    shortcode = extract_shortcode_from_url(req.url)
-    if not shortcode:
-        raise HTTPException(status_code=400, detail="URL de post inválida")
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return instaloader.Post.from_shortcode(L.context, shortcode)
+        except BadResponseException as e:
+            msg = str(e)
+            last_err = e
+            if "Please wait a few minutes before you try again" in msg:
+                wait = 60 * (attempt + 1)  # 1min, depois 2min, depois 3min...
+                print(f"[Rate limit IG] Tentativa {attempt+1}/{max_retries}, "
+                      f"esperando {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+        except QueryReturnedNotFoundException as e:
+            raise HTTPException(status_code=404, detail="Post não encontrado") from e
 
-    try:
-        post = Post.from_shortcode(L.context, shortcode)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao acessar o post: {e}. "
-                   f"Verifique se o post é público e se o login foi configurado."
-        )
+    # se chegou aqui, estourou as tentativas
+    raise HTTPException(
+        status_code=429,
+        detail="Instagram aplicou rate limit. Tente novamente mais tarde.",
+    ) from last_err
 
-    # Monta lista de mídias
-    media_list = []
 
-    # Verifica se é carrossel (sidecar)
-    if post.typename == "GraphSidecar":
-        # Post com várias imagens / vídeos (carrossel)
-        for idx, node in enumerate(post.get_sidecar_nodes()):
-            url = node.video_url if node.is_video else node.display_url
-            media_list.append({
-                "index": idx,
-                "is_video": node.is_video,
-                "media_url": url,
-            })
-    else:
-        # Post “normal” (uma imagem ou um vídeo)
-        url = post.video_url if post.is_video else post.url
-        media_list.append({
-            "index": 0,
-            "is_video": post.is_video,
-            "media_url": url,
-        })
-
-    # Pra manter compatibilidade, ainda mandamos o primeiro media_url no topo
-    first_media_url = media_list[0]["media_url"] if media_list else None
-
-    return {
-        "shortcode": shortcode,
-        "caption": post.caption or "",
-        "owner_username": post.owner_username,
-        "taken_at": post.date_utc.isoformat(),
-        "is_sidecar": post.typename == "GraphSidecar",
-        "media": media_list,          # TODAS as mídias
-        "media_url": first_media_url, # primeira mídia (legacy)
-    }
-    
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/post_info")
+def post_info(body: PostRequest):
+    """
+    Recebe uma URL de post/reel e retorna informações básicas.
+    Exemplo de body:
+    {
+      "url": "https://www.instagram.com/p/DRNRfHRD4VF/"
+    }
+    """
+    if not L.test_login():
+        raise HTTPException(
+            status_code=500,
+            detail="Sessão do Instagram não carregada. Verifique o arquivo de sessão.",
+        )
+
+    shortcode = shortcode_from_url(body.url)
+    try:
+        post = get_post_with_retry(shortcode)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao acessar o post: {str(e)}",
+        )
+
+    return {
+        "shortcode": shortcode,
+        "owner_username": post.owner_username,
+        "caption": post.caption,
+        "is_video": post.is_video,
+        "date_utc": post.date_utc.isoformat() if post.date_utc else None,
+        "likes": post.likes,
+        "comments": post.comments,
+        "slides_count": post.mediacount,  # qtd de imagens/vídeos no carrossel
+    }
